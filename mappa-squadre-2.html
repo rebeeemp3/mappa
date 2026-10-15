@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mappa squadre</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}
+body{margin:0;display:flex;height:100vh;font:15px/1.4 system-ui,sans-serif;color:#1d2730;background:#f5f7f8}
+aside{width:350px;max-width:45%;overflow-y:auto;padding:16px;background:#fff;border-right:1px solid #d9e0e4}
+#map{flex:1}
+h1{font-size:19px;margin:0 0 12px}
+button,input{font:inherit;padding:7px 10px;border:1px solid #b9c4cb;border-radius:6px;background:#fff}
+button{cursor:pointer}
+#login{background:#1f6f8b;color:#fff;border-color:#1f6f8b;width:100%;margin-bottom:12px}
+.row{display:flex;gap:6px;margin-bottom:12px;align-items:flex-end}
+.row input{width:100%;min-width:0}
+.dl{flex:1;display:flex;flex-direction:column;font-size:12px;color:#5a6b76;min-width:0}
+.srch input{flex:1}
+.team{display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer}
+.team i{width:14px;height:14px;border-radius:50%;flex:none}
+#status{font-size:13px;color:#5a6b76;margin:10px 0;min-height:18px}
+.grp{margin-top:14px;border-top:1px solid #e3e8eb;padding-top:8px}
+.grp>b{display:flex;align-items:center;gap:6px}
+.grp>b i{width:12px;height:12px;border-radius:50%}
+.dh{display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:600;font-size:14px}
+.ln{width:26px;flex:none}
+.ev{padding:4px 0 4px 34px;font-size:14px}.ev small{display:block;color:#5a6b76}
+.warn{color:#b3541e}
+.pin{width:28px;height:28px;border-radius:50%;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px #0006}
+.foot{margin-top:20px;font-size:12px}.foot a{color:#5a6b76;cursor:pointer;text-decoration:underline}
+@media(max-width:700px){body{flex-direction:column-reverse}aside{width:100%;max-width:none;height:50%}#map{height:50%}}
+</style>
+</head>
+<body>
+<aside>
+  <h1>Percorsi delle squadre</h1>
+  <button id="login">Accedi con Google</button>
+  <div class="row">
+    <button id="prev" title="Periodo precedente">◀</button>
+    <label class="dl">Dal<input type="date" id="from"></label>
+    <label class="dl">Al<input type="date" id="to"></label>
+    <button id="next" title="Periodo successivo">▶</button>
+  </div>
+  <div class="row srch">
+    <input id="q" placeholder="Cerca un luogo (segnaposto)">
+    <button id="go">📍</button>
+    <button id="clr" title="Togli i segnaposto">✕</button>
+  </div>
+  <div id="teams"></div>
+  <div id="status">Premi "Accedi con Google" per iniziare.</div>
+  <div id="list"></div>
+  <div class="foot"><a id="resetid">Cambia Client ID</a></div>
+</aside>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://accounts.google.com/gsi/client"></script>
+<script>
+// Se vuoi, incolla qui il Client ID. Altrimenti il programma te lo chiede una volta sola.
+const ID_FISSO = 'INCOLLA_QUI_IL_TUO_CLIENT_ID.apps.googleusercontent.com';
+const REFRESH_SECONDI = 60;
+const MAX_GIORNI = 14;
+
+const COLORS = ['#616161','#6036d5','#e6b800','#3f85b8','#6036d5','#c1345c','#6bb639','#56b9b1'];
+const DASH = [null,'12 8','2 8','16 6 3 6'];
+const LINE = ['solid','dashed','dotted','dashed'];
+const $ = id => document.getElementById(id);
+const esc = s => String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const iso = d => new Date(d.getTime() - d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+const dayLabel = k => new Date(k + 'T12:00:00').toLocaleDateString('it-IT', {weekday:'short', day:'numeric', month:'short'});
+const ls = localStorage;
+
+const map = L.map('map').setView([42.5, 12.5], 6);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap'}).addTo(map);
+const ph = L.featureGroup().addTo(map);
+
+let token = null, tokenClient = null, calendars = [], timer = null, renew = null;
+let busy = false, again = false, fit = true, layers = [];
+let selected = new Set(JSON.parse(ls.getItem('sel') || '[]'));
+const geoCache = JSON.parse(ls.getItem('geo') || '{}');
+const routeCache = {};
+$('from').value = $('to').value = iso(new Date());
+
+const setStatus = (t, warn) => { $('status').textContent = t; $('status').className = warn ? 'warn' : ''; };
+const color = id => COLORS[Math.max(0, calendars.findIndex(c => c.id === id)) % COLORS.length];
+
+function days() {
+  const out = [], a = new Date($('from').value + 'T12:00:00'), b = new Date($('to').value + 'T12:00:00');
+  for (const d = new Date(a); d <= b && out.length < MAX_GIORNI; d.setDate(d.getDate() + 1)) out.push(iso(d));
+  return out;
+}
+
+// ---- Login Google (si ricorda tra una visita e l'altra) ----
+function clientId() {
+  if (!ID_FISSO.startsWith('INCOLLA')) return ID_FISSO;
+  let v = ls.getItem('cid');
+  if (!v) {
+    v = (prompt('Incolla qui il tuo Client ID di Google (finisce con .apps.googleusercontent.com)') || '').trim();
+    if (v) ls.setItem('cid', v);
+  }
+  return v;
+}
+function initClient() {
+  if (tokenClient) return true;
+  const id = clientId();
+  if (!id) { setStatus('Serve il Client ID per accedere.', true); return false; }
+  tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: id,
+    scope: 'https://www.googleapis.com/auth/calendar.readonly',
+    callback: r => { if (r.access_token) useToken(r.access_token, r.expires_in); },
+    error_callback: () => { $('login').textContent = 'Riconnetti a Google'; setStatus('Per rinnovare l\'accesso premi "Riconnetti a Google".', true); }
+  });
+  return true;
+}
+function scheduleRenew(ms) {
+  clearTimeout(renew);
+  renew = setTimeout(() => { if (initClient()) tokenClient.requestAccessToken({prompt: ''}); }, Math.max(ms, 5000));
+}
+function useToken(t, sec) {
+  token = t;
+  ls.setItem('tok', JSON.stringify({t, e: Date.now() + (sec - 120) * 1000}));
+  ls.setItem('wasIn', '1');
+  $('login').textContent = 'Collegato a Google ✓';
+  scheduleRenew((sec - 120) * 1000);
+  begin();
+}
+async function begin() {
+  try {
+    if (!calendars.length) { await loadCalendars(); fit = true; }
+    refresh();
+    if (!timer) timer = setInterval(refresh, REFRESH_SECONDI * 1000);
+  } catch (e) { if (e.message !== '401') setStatus('Errore: ' + e.message, true); }
+}
+$('login').onclick = () => { if (initClient()) tokenClient.requestAccessToken(); };
+$('resetid').onclick = () => { ls.removeItem('cid'); ls.removeItem('tok'); location.reload(); };
+
+(function restore() {
+  const s = JSON.parse(ls.getItem('tok') || 'null');
+  if (s && s.e > Date.now()) {
+    token = s.t; $('login').textContent = 'Collegato a Google ✓';
+    scheduleRenew(s.e - Date.now()); begin();
+  } else if (ls.getItem('wasIn')) {
+    $('login').textContent = 'Riconnetti a Google';
+    setStatus('Premi "Riconnetti a Google" per continuare (un solo tocco).');
+  }
+})();
+
+async function api(path) {
+  const r = await fetch('https://www.googleapis.com/calendar/v3/' + path, {headers: {Authorization: 'Bearer ' + token}});
+  if (r.status === 401) {
+    token = null; ls.removeItem('tok');
+    $('login').textContent = 'Riconnetti a Google';
+    setStatus('Sessione scaduta: premi "Riconnetti a Google".', true);
+    throw new Error('401');
+  }
+  if (!r.ok) throw new Error('Errore Google ' + r.status);
+  return r.json();
+}
+
+async function loadCalendars() {
+  const d = await api('users/me/calendarList?minAccessRole=reader');
+  calendars = d.items || [];
+  $('teams').innerHTML = calendars.map(c =>
+    `<label class="team"><input type="checkbox" data-id="${esc(c.id)}" ${selected.has(c.id) ? 'checked' : ''}>
+     <i style="background:${color(c.id)}"></i>${esc(c.summary)}</label>`).join('');
+  $('teams').querySelectorAll('input').forEach(x => x.onchange = () => {
+    x.checked ? selected.add(x.dataset.id) : selected.delete(x.dataset.id);
+    ls.setItem('sel', JSON.stringify([...selected]));
+    fit = true; refresh();
+  });
+}
+
+// ---- Indirizzi (OpenStreetMap Nominatim) e percorsi (OSRM) ----
+let lastGeo = 0;
+async function nominatim(q) {
+  const now = Date.now(), at = Math.max(now, lastGeo + 1100);
+  lastGeo = at; if (at > now) await sleep(at - now); // 1 richiesta al secondo
+  const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=it&q=' + encodeURIComponent(q));
+  const j = await r.json();
+  return j[0] ? {ll: [+j[0].lat, +j[0].lon], name: j[0].display_name} : null;
+}
+async function geocode(q) {
+  if (q in geoCache) return geoCache[q];
+  const r = await nominatim(q), v = r ? r.ll : null;
+  geoCache[q] = v; ls.setItem('geo', JSON.stringify(geoCache));
+  return v;
+}
+async function route(pts) {
+  const key = pts.join(';');
+  if (routeCache[key]) return routeCache[key];
+  try {
+    const u = 'https://router.project-osrm.org/route/v1/driving/' + pts.map(p => p[1] + ',' + p[0]).join(';') + '?overview=full&geometries=geojson';
+    const j = await (await fetch(u)).json();
+    const rt = j.routes && j.routes[0];
+    if (rt) return routeCache[key] = {line: rt.geometry.coordinates.map(c => [c[1], c[0]]), km: rt.distance/1000, min: rt.duration/60};
+  } catch (e) {}
+  return null;
+}
+
+function fitAll() {
+  const b = L.featureGroup([...layers, ph]).getBounds();
+  if (b.isValid()) map.fitBounds(b.pad(.15), {maxZoom: 15});
+}
+
+// ---- Aggiornamento mappa ----
+async function refresh() {
+  if (!token) return;
+  if (busy) { again = true; return; }
+  busy = true;
+  try {
+    const ds = days();
+    if (!ds.length) throw new Error('date non valide');
+    const tMin = new Date(ds[0] + 'T00:00:00').toISOString();
+    const tMax = new Date(ds[ds.length-1] + 'T23:59:59').toISOString();
+    const newLayers = [];
+    let html = '', total = 0, missing = 0;
+
+    for (const cal of calendars.filter(c => selected.has(c.id))) {
+      setStatus('Carico ' + cal.summary + '…');
+      const data = await api(`calendars/${encodeURIComponent(cal.id)}/events?singleEvents=true&orderBy=startTime&maxResults=250&timeMin=${tMin}&timeMax=${tMax}`);
+      const byDay = {};
+      (data.items || []).filter(e => e.status !== 'cancelled' && e.start).forEach(e => {
+        const k = e.start.dateTime ? iso(new Date(e.start.dateTime)) : e.start.date;
+        (byDay[k] = byDay[k] || []).push(e);
+      });
+      const col = color(cal.id), g = L.featureGroup();
+      let n = 0;
+      html += `<div class="grp"><b><i style="background:${col}"></i>${esc(cal.summary)}</b>`;
+
+      for (const [di, k] of ds.entries()) {
+        const list = byDay[k] || [];
+        if (!list.length) continue;
+        n += list.length;
+        const pts = []; let items = '';
+        for (const e of list) {
+          const time = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'}) : 'tutto il giorno';
+          let ll = null;
+          if (e.location) {
+            setStatus('Cerco indirizzo: ' + e.location.slice(0, 40) + '…');
+            try { ll = await geocode(e.location); } catch (err) {}
+          }
+          if (ll) pts.push({ll, title: e.summary || '(senza titolo)', time, loc: e.location});
+          else if (e.location) missing++;
+          items += `<div class="ev">${time} — ${esc(e.summary || '(senza titolo)')}
+            <small class="${ll ? '' : 'warn'}">${e.location ? esc(e.location) + (ll ? '' : ' (indirizzo non trovato)') : 'nessun indirizzo'}</small></div>`;
+        }
+        let info = '';
+        if (pts.length > 1) {
+          const r = await route(pts.map(p => p.ll));
+          L.polyline(r ? r.line : pts.map(p => p.ll), {color: col, weight: r ? 5 : 3, opacity: r ? .8 : .45, dashArray: DASH[di % 4]}).addTo(g);
+          if (r) info = ` · ${r.km.toFixed(0)} km, ~${Math.round(r.min)} min`;
+        }
+        pts.forEach((p, i) => L.marker(p.ll, {icon: L.divIcon({className: '', iconSize: [28,28], iconAnchor: [14,14],
+          html: `<div class="pin" style="background:${col}">${i+1}</div>`})})
+          .bindPopup(`<b>${esc(p.title)}</b><br>${dayLabel(k)}, ${p.time}<br>${esc(p.loc)}<br><i>${esc(cal.summary)}</i>`).addTo(g));
+        html += `<div class="dh"><span class="ln" style="border-top:3px ${LINE[di % 4]} ${col}"></span>${dayLabel(k)}${info}</div>${items}`;
+      }
+      if (!n) html += '<div class="ev">Nessun appuntamento</div>';
+      html += '</div>';
+      total += n; newLayers.push(g);
+    }
+
+    layers.forEach(l => map.removeLayer(l));
+    layers = newLayers;
+    layers.forEach(l => l.addTo(map));
+    if (fit) { fitAll(); fit = false; }
+    $('list').innerHTML = html;
+    setStatus(selected.size ? `${total} appuntamenti · aggiornato alle ${new Date().toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'})}` + (missing ? ` · ${missing} indirizzi non trovati` : '') : 'Spunta una o più squadre.', missing > 0);
+  } catch (e) {
+    if (e.message !== '401') setStatus('Errore: ' + e.message, true);
+  }
+  busy = false;
+  if (again) { again = false; refresh(); }
+}
+
+// ---- Segnaposto ----
+$('go').onclick = async () => {
+  const q = $('q').value.trim();
+  if (!q) return;
+  setStatus('Cerco "' + q + '"…');
+  try {
+    const r = await nominatim(q);
+    if (!r) { setStatus('Luogo non trovato: prova ad aggiungere la città.', true); return; }
+    L.marker(r.ll, {icon: L.divIcon({className: '', iconSize: [30,30], iconAnchor: [15,28],
+      html: '<div style="font-size:30px;line-height:30px;filter:drop-shadow(0 1px 2px #0008)">📍</div>'})})
+      .bindPopup(`<b>${esc(q)}</b><br>${esc(r.name)}`).addTo(ph).openPopup();
+    fitAll(); setStatus('Segnaposto aggiunto. Con ✕ li togli tutti.');
+  } catch (e) { setStatus('Ricerca non riuscita, riprova.', true); }
+};
+$('q').onkeydown = e => { if (e.key === 'Enter') $('go').click(); };
+$('clr').onclick = () => ph.clearLayers();
+
+// ---- Cambio periodo ----
+$('from').onchange = () => { if ($('to').value < $('from').value) $('to').value = $('from').value; fit = true; refresh(); };
+$('to').onchange = () => { if ($('to').value < $('from').value) $('from').value = $('to').value; fit = true; refresh(); };
+const shift = dir => {
+  const n = days().length || 1;
+  for (const id of ['from', 'to']) { const d = new Date($(id).value + 'T12:00:00'); d.setDate(d.getDate() + dir * n); $(id).value = iso(d); }
+  fit = true; refresh();
+};
+$('prev').onclick = () => shift(-1);
+$('next').onclick = () => shift(1);
+</script>
+</body>
+</html>
