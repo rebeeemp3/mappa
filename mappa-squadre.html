@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Mappa squadre</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+*{box-sizing:border-box}
+body{margin:0;display:flex;height:100vh;font:15px/1.4 system-ui,sans-serif;color:#1d2730;background:#f5f7f8}
+aside{width:340px;max-width:45%;overflow-y:auto;padding:16px;background:#fff;border-right:1px solid #d9e0e4}
+#map{flex:1}
+h1{font-size:19px;margin:0 0 12px}
+button,input[type=date]{font:inherit;padding:7px 11px;border:1px solid #b9c4cb;border-radius:6px;background:#fff;cursor:pointer}
+#login{background:#1f6f8b;color:#fff;border-color:#1f6f8b;width:100%;margin-bottom:12px}
+.row{display:flex;gap:6px;margin-bottom:12px}.row input{flex:1}
+.team{display:flex;align-items:center;gap:8px;padding:5px 0;cursor:pointer}
+.team i{width:14px;height:14px;border-radius:50%;flex:none}
+#status{font-size:13px;color:#5a6b76;margin:10px 0;min-height:18px}
+.grp{margin-top:14px;border-top:1px solid #e3e8eb;padding-top:8px}
+.grp b{display:flex;align-items:center;gap:6px}
+.grp b i{width:12px;height:12px;border-radius:50%}
+.ev{padding:5px 0 5px 18px;font-size:14px}.ev small{display:block;color:#5a6b76}
+.warn{color:#b3541e}
+.pin{width:28px;height:28px;border-radius:50%;color:#fff;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid #fff;box-shadow:0 1px 4px #0006}
+@media(max-width:700px){body{flex-direction:column-reverse}aside{width:100%;max-width:none;height:45%}#map{height:55%}}
+</style>
+</head>
+<body>
+<aside>
+  <h1>Percorsi delle squadre</h1>
+  <button id="login">Accedi con Google</button>
+  <div class="row">
+    <button id="prev" title="Giorno prima">◀</button>
+    <input type="date" id="day">
+    <button id="next" title="Giorno dopo">▶</button>
+  </div>
+  <div id="teams"></div>
+  <div id="status">Premi "Accedi con Google" per iniziare.</div>
+  <div id="list"></div>
+</aside>
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://accounts.google.com/gsi/client"></script>
+<script>
+// ====== DA COMPILARE ======
+const CLIENT_ID = 'INCOLLA_QUI_IL_TUO_CLIENT_ID.apps.googleusercontent.com';
+const REFRESH_SECONDI = 60;   // aggiornamento automatico
+// ==========================
+
+const COLORS = ['#e6194b','#2e9e44','#3257d6','#f58231','#911eb4','#008b8b','#9a6324','#d81b8a'];
+const $ = id => document.getElementById(id);
+const esc = s => String(s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const iso = d => new Date(d.getTime() - d.getTimezoneOffset()*6e4).toISOString().slice(0,10);
+
+const map = L.map('map').setView([42.5, 12.5], 6);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {attribution:'© OpenStreetMap'}).addTo(map);
+
+let token = null, tokenClient = null, calendars = [], timer = null, busy = false, again = false, fit = true, layers = [];
+let selected = new Set(JSON.parse(localStorage.getItem('sel') || '[]'));
+const geoCache = JSON.parse(localStorage.getItem('geo') || '{}');
+$('day').value = iso(new Date());
+
+const setStatus = (t, warn) => { $('status').textContent = t; $('status').className = warn ? 'warn' : ''; };
+const color = id => COLORS[Math.max(0, calendars.findIndex(c => c.id === id)) % COLORS.length];
+
+// ---- Login Google ----
+$('login').onclick = () => {
+  if (!tokenClient) {
+    tokenClient = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: 'https://www.googleapis.com/auth/calendar.readonly',
+      callback: r => { if (r.access_token) { token = r.access_token; $('login').textContent = 'Collegato a Google'; start(); } }
+    });
+  }
+  tokenClient.requestAccessToken();
+};
+
+async function api(path) {
+  const r = await fetch('https://www.googleapis.com/calendar/v3/' + path, {headers: {Authorization: 'Bearer ' + token}});
+  if (r.status === 401) { token = null; setStatus('Sessione scaduta: premi di nuovo "Accedi con Google".', true); throw new Error('401'); }
+  if (!r.ok) throw new Error('Errore Google ' + r.status);
+  return r.json();
+}
+
+async function start() {
+  const d = await api('users/me/calendarList?minAccessRole=reader');
+  calendars = d.items || [];
+  $('teams').innerHTML = calendars.map(c =>
+    `<label class="team"><input type="checkbox" data-id="${esc(c.id)}" ${selected.has(c.id) ? 'checked' : ''}>
+     <i style="background:${color(c.id)}"></i>${esc(c.summary)}</label>`).join('');
+  $('teams').querySelectorAll('input').forEach(x => x.onchange = () => {
+    x.checked ? selected.add(x.dataset.id) : selected.delete(x.dataset.id);
+    localStorage.setItem('sel', JSON.stringify([...selected]));
+    fit = true; refresh();
+  });
+  fit = true; refresh();
+  clearInterval(timer); timer = setInterval(refresh, REFRESH_SECONDI * 1000);
+}
+
+// ---- Geocoding (OpenStreetMap Nominatim) e percorsi (OSRM) ----
+async function geocode(q) {
+  if (q in geoCache) return geoCache[q];
+  await sleep(1100); // limite del servizio gratuito: 1 richiesta al secondo
+  const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=it&q=' + encodeURIComponent(q));
+  const j = await r.json();
+  const v = j[0] ? [+j[0].lat, +j[0].lon] : null;
+  geoCache[q] = v;
+  localStorage.setItem('geo', JSON.stringify(geoCache));
+  return v;
+}
+
+async function route(pts) {
+  try {
+    const u = 'https://router.project-osrm.org/route/v1/driving/' + pts.map(p => p[1] + ',' + p[0]).join(';') + '?overview=full&geometries=geojson';
+    const j = await (await fetch(u)).json();
+    const rt = j.routes && j.routes[0];
+    if (rt) return {line: rt.geometry.coordinates.map(c => [c[1], c[0]]), km: rt.distance/1000, min: rt.duration/60};
+  } catch (e) {}
+  return null;
+}
+
+// ---- Aggiornamento mappa ----
+async function refresh() {
+  if (!token) return;
+  if (busy) { again = true; return; }
+  busy = true;
+  try {
+    const day = $('day').value;
+    const tMin = new Date(day + 'T00:00:00').toISOString();
+    const tMax = new Date(day + 'T23:59:59').toISOString();
+    const newLayers = [];
+    let html = '', total = 0, missing = 0;
+
+    for (const cal of calendars.filter(c => selected.has(c.id))) {
+      setStatus('Carico ' + cal.summary + '…');
+      const data = await api(`calendars/${encodeURIComponent(cal.id)}/events?singleEvents=true&orderBy=startTime&timeMin=${tMin}&timeMax=${tMax}`);
+      const evs = (data.items || []).filter(e => e.status !== 'cancelled');
+      const col = color(cal.id), pts = [];
+      let items = '';
+
+      for (const e of evs) {
+        const time = e.start.dateTime ? new Date(e.start.dateTime).toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'}) : 'tutto il giorno';
+        let ll = null;
+        if (e.location) {
+          setStatus('Cerco indirizzo: ' + e.location.slice(0, 40) + '…');
+          try { ll = await geocode(e.location); } catch (err) {}
+        }
+        if (ll) { pts.push({ll, title: e.summary || '(senza titolo)', time, loc: e.location}); }
+        else if (e.location) { missing++; }
+        items += `<div class="ev">${time} — ${esc(e.summary || '(senza titolo)')}
+          <small class="${ll ? '' : 'warn'}">${e.location ? esc(e.location) + (ll ? '' : ' (indirizzo non trovato)') : 'nessun indirizzo'}</small></div>`;
+      }
+
+      const g = L.featureGroup();
+      let info = '';
+      if (pts.length > 1) {
+        const r = await route(pts.map(p => p.ll));
+        L.polyline(r ? r.line : pts.map(p => p.ll), {color: col, weight: 5, opacity: .8, dashArray: r ? null : '8 8'}).addTo(g);
+        if (r) info = ` · ${r.km.toFixed(0)} km, circa ${Math.round(r.min)} min di guida`;
+      }
+      pts.forEach((p, i) => L.marker(p.ll, {icon: L.divIcon({className: '', iconSize: [28,28], iconAnchor: [14,14],
+        html: `<div class="pin" style="background:${col}">${i+1}</div>`})})
+        .bindPopup(`<b>${esc(p.title)}</b><br>${p.time}<br>${esc(p.loc)}<br><i>${esc(cal.summary)}</i>`).addTo(g));
+      newLayers.push(g);
+      total += evs.length;
+      html += `<div class="grp"><b><i style="background:${col}"></i>${esc(cal.summary)}</b>
+        <small>${evs.length} appuntamenti${info}</small>${items || '<div class="ev">Nessun appuntamento</div>'}</div>`;
+    }
+
+    layers.forEach(l => map.removeLayer(l));
+    layers = newLayers;
+    layers.forEach(l => l.addTo(map));
+    if (fit) {
+      const all = L.featureGroup(layers);
+      if (all.getLayers().length) map.fitBounds(all.getBounds().pad(.15));
+      fit = false;
+    }
+    $('list').innerHTML = html;
+    setStatus(selected.size ? `${total} appuntamenti · aggiornato alle ${new Date().toLocaleTimeString('it-IT', {hour:'2-digit', minute:'2-digit'})}` + (missing ? ` · ${missing} indirizzi non trovati` : '') : 'Spunta una o più squadre.', missing > 0);
+  } catch (e) {
+    if (e.message !== '401') setStatus('Errore: ' + e.message, true);
+  }
+  busy = false;
+  if (again) { again = false; refresh(); }
+}
+
+// ---- Cambio giorno ----
+$('day').onchange = () => { fit = true; refresh(); };
+const shift = n => { const d = new Date($('day').value + 'T12:00:00'); d.setDate(d.getDate() + n); $('day').value = iso(d); fit = true; refresh(); };
+$('prev').onclick = () => shift(-1);
+$('next').onclick = () => shift(1);
+</script>
+</body>
+</html>
